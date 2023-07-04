@@ -1,120 +1,112 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, Type};
+use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, FieldsNamed};
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+    let ast = parse_macro_input!(input as DeriveInput);
 
-    let name = input.ident;
-    let builder_ident = format_ident!("{}Builder", &name);
-    if let Data::Struct(DataStruct {
-        fields: Fields::Named(named_fields, ..),
+    let name = &ast.ident;
+    let builder_ident = format_ident!("{}Builder", name);
+    let fields = if let Data::Struct(DataStruct {
+        fields: Fields::Named(FieldsNamed { ref named, .. }, ..),
         ..
-    }) = input.data
+    }) = ast.data
     {
-        let fields_ident_ty = named_fields.named.iter().map(|f| (f.ident.as_ref(), &f.ty));
-        let fields_ident = fields_ident_ty.clone().map(|f| f.0.unwrap());
+        named
+    } else {
+        unimplemented!()
+    };
 
-        // define *Builder struct
-        let builder_fields = fields_ident_ty.clone().map(|field| {
-            let name = field.0.unwrap();
-            let ty = field.1;
-            let opt_ty = is_optional(ty).unwrap_or(ty);
-            quote! {
-                #name: Option<#opt_ty>
-            }
-        });
+    // define *Builder struct
+    let builder_fields = fields.iter().map(|f| {
+        let name = &f.ident;
+        let ty = &f.ty;
+        if ty_inner_type("Option", ty).is_some() {
+            quote! { #name: #ty }
+        } else {
+            quote! { #name: ::std::option::Option<#ty> }
+        }
+    });
 
-        let builder_struct = quote! {
-            pub struct #builder_ident {
-                #(#builder_fields),*
-            }
+    // impl `builder()` method
+    let build_empty = fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! { #name: ::std::option::Option::None }
+    });
+
+    // impl set method for each fields
+    let set_methods = fields.iter().map(|f|{
+        let name = f.ident.as_ref().unwrap();
+        let ty = &f.ty;
+        let arg_ty = if let Some(inner_ty) = ty_inner_type("Option", ty) {
+            inner_ty
+        } else {
+            ty
         };
+        quote! {
+            pub fn #name(&mut self, #name: #arg_ty) -> &mut Self {
+                self.#name = Some(#name);
+                self
+            }
+        }
+    });
+    
+    // impl `build()` method
+    let build_fields = fields.iter().map(|f| {
+        let name = &f.ident;
+        if ty_inner_type("Option", &f.ty).is_some() {
+            quote! {
+                #name: self.#name.clone()
+            }
+        } else {
+            quote! {
+                #name: self.#name.clone().ok_or(concat!(stringify!(#name), " is not set"))?
+            }
+        }
+    });
 
-        // impl `builder()` method
-        let idents = fields_ident.clone();
-        let builder_method = quote! {
-            impl #name {
-                pub fn builder() -> #builder_ident {
-                    #builder_ident {
-                        #(#idents: None),*
-                    }
+    // Combine all the generated tokens into a single `proc_macro2::TokenStream`
+    TokenStream::from(quote! {
+        pub struct #builder_ident {
+            #(#builder_fields),*
+        }
+
+        impl #name {
+            pub fn builder() -> #builder_ident {
+                #builder_ident {
+                    #(#build_empty),*
                 }
             }
-        };
+        }
+        
+        impl #builder_ident {
+            
+            #(#set_methods)*
 
-        // impl methods on the builder for setting a value of each of the struct fields
-        let set_methods_iterator = fields_ident_ty.clone().map(|field| {
-            let name = field.0.unwrap();
-            let ty = field.1;
-            let ty = is_optional(ty).unwrap_or(ty);
-            quote! {
-                fn #name(&mut self, #name: #ty) -> &mut Self {
-                    self.#name = Some(#name);
-                    self
-                }
-            }
-        });
-
-        // impl `build()` method
-        let optional_idents = fields_ident_ty.clone().filter_map(|field| {
-            let name = field.0.unwrap();
-            let ty = field.1;
-            is_optional(ty).map(|_| name)
-        });
-        let nonoptional_idents = fields_ident_ty.clone().filter_map(|field| {
-            let name = field.0.unwrap();
-            let ty = field.1;
-            if is_optional(ty).is_some() {
-                None
-            } else {
-                Some(name)
-            }
-        });
-        let build_method = quote! {
-            pub fn build(&mut self) -> Result<#name, Box<dyn std::error::Error>> {
-                Ok(#name {
-                    #(#nonoptional_idents: self.#nonoptional_idents.clone().take().ok_or("missing field")?),*,
-                    #(#optional_idents: self.#optional_idents.clone()),*
+            pub fn build(&mut self) -> ::std::result::Result<#name, ::std::boxed::Box<dyn ::std::error::Error>> {
+                ::std::result::Result::Ok(#name {
+                    #(#build_fields),*
                 })
             }
-        };
-
-        let set_methods = quote! {
-            impl #builder_ident {
-                #(#set_methods_iterator)*
-                #build_method
-            }
-        };
-
-        // Combine all the generated tokens into a single `proc_macro2::TokenStream`
-        TokenStream::from(quote! {
-            #builder_struct
-            #builder_method
-            #set_methods
-        })
-    } else {
-        panic!("Only structs with named fields are supported")
-    }
+        }
+    })
 }
 
-fn is_optional(ty: &Type) -> Option<&Type> {
-    if let syn::Type::Path(type_path) = ty {
-        let path = &type_path.path;
-        if path.segments.len() != 1 {
+fn ty_inner_type<'a>(wrapper: &str, ty: &'a syn::Type) -> Option<&'a syn::Type> {
+    if let syn::Type::Path(ref p) = ty {
+        if p.path.segments.len() != 1 || p.path.segments[0].ident != wrapper {
             return None;
         }
-        if let Some(segment) = path.segments.last() {
-            if segment.ident == "Option" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if args.args.len() != 1 {
-                        return None;
-                    }
-                    if let syn::GenericArgument::Type(ty) = args.args.first().unwrap() {
-                        return Some(ty);
-                    }
-                }
+
+        if let syn::PathArguments::AngleBracketed(ref inner_ty) = p.path.segments[0].arguments {
+            if inner_ty.args.len() != 1 {
+                return None;
+            }
+
+            let inner_ty = inner_ty.args.first().unwrap();
+            if let syn::GenericArgument::Type(ref t) = inner_ty {
+                return Some(t);
             }
         }
     }
